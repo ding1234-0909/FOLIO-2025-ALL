@@ -35,6 +35,13 @@ export class Respawns
 
             this.items.set(name, item)
         }
+
+        // 地块内部出生点（plot fence 围合范围中心附近，约距围墙 5–10 m）
+        this.items.set('fence', {
+            name: 'fence',
+            position: new THREE.Vector3(15, 4, -60),
+            rotation: 0,
+        })
     }
 
     getByName(name)

@@ -30,6 +30,7 @@ import { Benches } from './Benches.js'
 import { Scenery } from './Scenery.js'
 import { Spiderman } from './Spiderman.js'
 import { Garden } from './Garden.js'
+import { PlotFence } from './PlotFence.js'
 
 export class World
 {
@@ -82,6 +83,7 @@ export class World
             this.areas = new Areas()
             this.spiderman = new Spiderman()
             this.garden = new Garden()
+            this.plotFence = new PlotFence()
         }
         else if(step === 2)
         {

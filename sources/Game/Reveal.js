@@ -172,7 +172,7 @@ export class Reveal
 
             // Inputs
             this.game.inputs.filters.clear()
-            this.game.inputs.filters.add('wandering')
+            this.game.inputs.filters.add(this.game.character.active ? 'walking' : 'wandering')
 
             // View
             this.game.view.focusPoint.isTracking = true

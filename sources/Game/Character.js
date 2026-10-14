@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu'
+import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js'
 import { Game } from './Game.js'
 import { Player } from './Player.js'
 import { clamp, smallestAngle } from './utilities/maths.js'
@@ -42,6 +43,9 @@ export class Character
         this.setAnimations()
         this.setInputs()
 
+        // Start the game in the car (character stays inactive/hidden)
+        this.enterVehicle()
+
         this.game.ticker.events.on('tick', () =>
         {
             this.updatePrePhysics()
@@ -57,7 +61,8 @@ export class Character
 
     setVisual()
     {
-        const model = this.game.resources.characterModel.scene
+        // The Spider-Man statue already uses the original model, so clone it (rebinding its skeleton)
+        const model = cloneSkeleton(this.game.resources.spidermanModel.scene)
 
         // Prevent wrong culling with skinned meshes
         model.traverse((child) =>
@@ -66,8 +71,39 @@ export class Character
                 child.frustumCulled = false
         })
 
+        // Bounds from the geometry itself, a skinned mesh bounding box can be unreliable
+        model.updateMatrixWorld(true)
+        const box = new THREE.Box3()
+        const meshBox = new THREE.Box3()
+        model.traverse((child) =>
+        {
+            if(child.isMesh && child.geometry)
+            {
+                if(! child.geometry.boundingBox)
+                    child.geometry.computeBoundingBox()
+
+                meshBox.copy(child.geometry.boundingBox).applyMatrix4(child.matrixWorld)
+                box.union(meshBox)
+            }
+        })
+
+        // Scale the model to the capsule height
+        const targetHeight = this.settings.capsuleRadius * 2 + this.settings.capsuleHalfHeight * 2
+        const size = box.getSize(new THREE.Vector3())
+        const scale = targetHeight / size.y
+        model.scale.setScalar(scale)
+
+        // Put the feet and the center on the group origin
+        model.position.x -= (box.min.x + box.max.x) * 0.5 * scale
+        model.position.y -= box.min.y * scale
+        model.position.z -= (box.min.z + box.max.z) * 0.5 * scale
+
+        // Wrapper so the character can be moved and rotated as a whole
+        this.model = new THREE.Group()
+        this.model.add(model)
+
         this.object = this.game.objects.add({
-            model: model
+            model: this.model
         })
         this.object3D = this.object.visual.object3D
         this.object3D.visible = false
@@ -107,8 +143,6 @@ export class Character
     {
         const resource = this.game.resources.characterModel
 
-        this.mixer = new THREE.AnimationMixer(resource.scene)
-
         // Clip names from the Universal Animation Library
         this.clipNames = {
             idle: 'Idle_Loop',
@@ -126,11 +160,28 @@ export class Character
             sprint: this.settings.sprintSpeed
         }
 
-        this.animations = {}
+        // Only retarget the clips we actually use
+        const sourceClips = []
 
         for(const name in this.clipNames)
         {
             const clip = THREE.AnimationClip.findByName(resource.animations, this.clipNames[name])
+
+            if(clip)
+                sourceClips.push(clip)
+        }
+
+        // The Spider-Man rig has no Universal Animation Library clips, so the character's
+        // animations are transferred onto its bones
+        const clips = this.retargetClips(resource.scene, sourceClips, this.model)
+
+        this.mixer = new THREE.AnimationMixer(this.model)
+
+        this.animations = {}
+
+        for(const name in this.clipNames)
+        {
+            const clip = clips.get(this.clipNames[name])
 
             if(! clip)
                 continue
@@ -161,10 +212,202 @@ export class Character
         })
     }
 
+    /**
+     * Transfers the source rig animations onto the target rig.
+     * The world space rotation delta (compared to the rest pose) of each source bone is
+     * applied on top of the matching target bone rest pose, which makes it work even
+     * though both rigs have different rest orientations.
+     */
+    retargetClips(sourceRoot, sourceClips, targetRoot)
+    {
+        // Source character rig bone name => Spider-Man rig bone name
+        const aliases = {
+            Head: 'head',
+            neck_01: 'neck',
+            lowerarm_l: 'forearm_l',
+            lowerarm_r: 'forearm_r'
+        }
+
+        const identity = new THREE.Quaternion()
+
+        // Rest world quaternions of every node (used as static parents)
+        const sourceRestWorld = new Map()
+        const sourceRestWorldInverse = new Map()
+        sourceRoot.updateMatrixWorld(true)
+        sourceRoot.traverse((child) =>
+        {
+            const quaternion = child.getWorldQuaternion(new THREE.Quaternion())
+            sourceRestWorld.set(child, quaternion)
+            sourceRestWorldInverse.set(child, quaternion.clone().invert())
+        })
+
+        const targetRestWorld = new Map()
+        targetRoot.updateMatrixWorld(true)
+        targetRoot.traverse((child) =>
+        {
+            targetRestWorld.set(child, child.getWorldQuaternion(new THREE.Quaternion()))
+        })
+
+        // Bones, in hierarchy order (parents first)
+        const sourceBones = []
+        sourceRoot.traverse((child) => { if(child.isBone) sourceBones.push(child) })
+
+        const targetBones = []
+        const targetBoneByName = new Map()
+        targetRoot.traverse((child) =>
+        {
+            if(child.isBone)
+            {
+                targetBones.push(child)
+                targetBoneByName.set(child.name, child)
+            }
+        })
+
+        // Matching bones
+        const pairs = []
+        const pairByTarget = new Map()
+
+        for(const sourceBone of sourceBones)
+        {
+            let targetBone = targetBoneByName.get(sourceBone.name)
+
+            if(! targetBone && aliases[sourceBone.name])
+                targetBone = targetBoneByName.get(aliases[sourceBone.name])
+
+            if(targetBone)
+            {
+                const pair = { sourceBone, targetBone }
+                pairs.push(pair)
+                pairByTarget.set(targetBone, pair)
+            }
+        }
+
+        if(pairs.length === 0)
+            return new Map()
+
+        const sourceRestLocal = new Map()
+        for(const bone of sourceBones)
+            sourceRestLocal.set(bone, bone.quaternion.clone())
+
+        const suffix = '.quaternion'
+        const fps = 30
+        const clips = new Map()
+
+        for(const sourceClip of sourceClips)
+        {
+            // Interpolants of the source quaternion tracks
+            const interpolants = new Map()
+
+            for(const track of sourceClip.tracks)
+            {
+                if(! track.name.endsWith(suffix))
+                    continue
+
+                const name = track.name.slice(0, - suffix.length)
+                const bone = sourceBones.find((_bone) => _bone.name === name)
+
+                if(bone)
+                    interpolants.set(bone, track.createInterpolant())
+            }
+
+            const steps = Math.max(2, Math.ceil(sourceClip.duration * fps) + 1)
+            const times = new Float32Array(steps)
+            const values = new Map()
+
+            for(const pair of pairs)
+                values.set(pair.targetBone, new Float32Array(steps * 4))
+
+            const sourceWorld = new Map()
+            const targetWorld = new Map()
+            const sourceLocal = new THREE.Quaternion()
+            const delta = new THREE.Quaternion()
+            const worldQuaternion = new THREE.Quaternion()
+            const parentQuaternion = new THREE.Quaternion()
+            const localQuaternion = new THREE.Quaternion()
+            const sample = new Float32Array(4)
+
+            for(let i = 0; i < steps; i++)
+            {
+                const time = Math.min(i / fps, sourceClip.duration)
+                times[i] = time
+
+                // Source pose
+                sourceWorld.clear()
+
+                for(const bone of sourceBones)
+                {
+                    const interpolant = interpolants.get(bone)
+
+                    if(interpolant)
+                    {
+                        interpolant.evaluate(time, sample)
+                        sourceLocal.set(sample[0], sample[1], sample[2], sample[3])
+                    }
+                    else
+                    {
+                        sourceLocal.copy(sourceRestLocal.get(bone))
+                    }
+
+                    parentQuaternion.copy(sourceWorld.get(bone.parent) || sourceRestWorld.get(bone.parent) || identity)
+                    worldQuaternion.copy(parentQuaternion).multiply(sourceLocal)
+                    sourceWorld.set(bone, worldQuaternion.clone())
+                }
+
+                // Target pose
+                targetWorld.clear()
+
+                for(const targetBone of targetBones)
+                {
+                    const pair = pairByTarget.get(targetBone)
+
+                    if(pair)
+                    {
+                        delta.copy(sourceWorld.get(pair.sourceBone)).multiply(sourceRestWorldInverse.get(pair.sourceBone))
+                        worldQuaternion.copy(delta).multiply(targetRestWorld.get(targetBone))
+                    }
+                    else
+                    {
+                        worldQuaternion.copy(targetRestWorld.get(targetBone))
+                    }
+
+                    parentQuaternion.copy(targetWorld.get(targetBone.parent) || targetRestWorld.get(targetBone.parent) || identity)
+                    targetWorld.set(targetBone, worldQuaternion.clone())
+
+                    if(pair)
+                    {
+                        localQuaternion.copy(parentQuaternion).invert().multiply(worldQuaternion)
+
+                        const array = values.get(targetBone)
+                        const offset = i * 4
+                        array[offset + 0] = localQuaternion.x
+                        array[offset + 1] = localQuaternion.y
+                        array[offset + 2] = localQuaternion.z
+                        array[offset + 3] = localQuaternion.w
+                    }
+                }
+            }
+
+            const tracks = []
+
+            for(const pair of pairs)
+            {
+                tracks.push(new THREE.QuaternionKeyframeTrack(
+                    `${pair.targetBone.name}${suffix}`,
+                    times,
+                    values.get(pair.targetBone)
+                ))
+            }
+
+            clips.set(sourceClip.name, new THREE.AnimationClip(sourceClip.name, sourceClip.duration, tracks))
+        }
+
+        return clips
+    }
+
     setInputs()
     {
         this.game.inputs.addActions([
-            { name: 'characterToggle',   categories: [ 'wandering', 'walking' ], keys: [ 'Keyboard.KeyC' ] },
+            { name: 'characterToggle',   categories: [ 'wandering', 'walking' ], keys: [ 'Keyboard.KeyF' ] },
             { name: 'characterForward',  categories: [ 'walking' ], keys: [ 'Keyboard.ArrowUp', 'Keyboard.KeyW', 'Gamepad.up' ] },
             { name: 'characterBackward', categories: [ 'walking' ], keys: [ 'Keyboard.ArrowDown', 'Keyboard.KeyS', 'Gamepad.down' ] },
             { name: 'characterLeft',     categories: [ 'walking' ], keys: [ 'Keyboard.ArrowLeft', 'Keyboard.KeyA', 'Gamepad.left' ] },
@@ -198,7 +441,7 @@ export class Character
         }
     }
 
-    exitVehicle()
+    exitVehicle(updateInputs = true)
     {
         // Compute position on the left side of the vehicle
         const vehiclePosition = this.game.physicalVehicle.position
@@ -235,8 +478,12 @@ export class Character
         this.setAnimation('idle')
 
         // Inputs
-        this.game.inputs.filters.clear()
-        this.game.inputs.filters.add('walking')
+        // (skipped on start, the intro is in charge of the filters)
+        if(updateInputs)
+        {
+            this.game.inputs.filters.clear()
+            this.game.inputs.filters.add('walking')
+        }
 
         // View > Focus point
         this.game.view.focusPoint.isTracking = true
@@ -483,6 +730,7 @@ export class Character
         /**
          * Animations
          */
+        if(! new URLSearchParams(window.location.search).has('noanim'))
         this.mixer.update(this.game.ticker.deltaScaled)
 
         if(this.grounded)

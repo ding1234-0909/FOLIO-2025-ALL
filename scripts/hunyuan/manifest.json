@@ -15,6 +15,16 @@
     },
     "assets": [
         {
+            "key": "woodFence",
+            "name": "木栅栏",
+            "enabled": true,
+            "prompt": "中国古典园林木栅栏，独立构件，长2米、高1米，深棕色实木，竖向木条均匀排列，上下两道横梁，两端立柱齐平便于首尾拼接，无背景，无地面，真实比例，游戏环境资产",
+            "normalize": { "axis": "y", "target": 1.0 },
+            "rotationFix": [0, 0, 0],
+            "collider": "cuboid",
+            "notes": "地块围栏模块：沿「我的地块」周长等距实例化摆放（sources/Game/World/PlotFence.js）。normalize 只按 y 轴定高，长度由代码按包围盒实测自适应（旋转修正按首轮实测回填 rotationFix）"
+        },
+        {
             "key": "gardenBase",
             "name": "石台基（地基）",
             "enabled": true,

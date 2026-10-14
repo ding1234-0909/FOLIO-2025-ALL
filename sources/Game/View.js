@@ -18,6 +18,7 @@ export class View
 {
     static MODE_DEFAULT = 1
     static MODE_FREE = 2
+    static MODE_COCKPIT = 3
 
     constructor(idealRatio = 1920 / 1080)
     {
@@ -82,34 +83,64 @@ export class View
         }, 1)
 
         // Toggle
+        this.game.inputs.addActions([
+            { name: 'viewToggle', categories: [ 'intro', 'wandering', 'walking', 'racing' ], keys: [ 'Keyboard.KeyV' ] }
+        ])
+
+        this.game.inputs.events.on('viewToggle', (action) =>
+        {
+            if(action.active)
+            {
+                this.toggleMode()
+            }
+        })
+
         if(this.game.debug.active)
         {
-            this.game.inputs.addActions([
-                { name: 'viewToggle', categories: [], keys: [ 'Keyboard.KeyV' ] }
-            ])
-
-            this.game.inputs.events.on('viewToggle', (action) =>
-            {
-                if(action.active)
+            this.debugPanel.addBinding(
+                this,
+                'mode',
                 {
-                    this.toggleMode()
+                    options:
+                    {
+                        default: View.MODE_DEFAULT,
+                        free: View.MODE_FREE,
+                        cockpit: View.MODE_COCKPIT,
+                    }
                 }
+            ).on('change', () => 
+            {
+                this.setMode(this.mode)
             })
         }
     }
 
     toggleMode()
     {
-        this.setMode(this.mode === View.MODE_FREE ? View.MODE_DEFAULT : View.MODE_FREE)
+        // 循环：DEFAULT → COCKPIT → FREE → DEFAULT
+        const next = this.mode === View.MODE_DEFAULT ? View.MODE_COCKPIT
+                   : this.mode === View.MODE_COCKPIT ? View.MODE_FREE
+                   : View.MODE_DEFAULT
+        this.setMode(next)
     }
 
     setMode(mode)
     {
         this.mode = mode
 
-        // Leaving default mode => Release the pointer
-        if(mode !== View.MODE_DEFAULT && this.mouseLook && this.mouseLook.isLocked)
+        // Leaving default/cockpit mode => Release the pointer
+        if(mode !== View.MODE_DEFAULT && mode !== View.MODE_COCKPIT && this.mouseLook && this.mouseLook.isLocked)
             document.exitPointerLock()
+
+        // 重置用户视角偏移
+        if((mode === View.MODE_DEFAULT || mode === View.MODE_COCKPIT) && this.mouseLook)
+        {
+            this.mouseLook.yawOffset = 0
+            this.mouseLook.pitchOffset = 0
+            // 同时清零角度二阶速度，避免切回来首帧过冲
+            this.spherical.baseThetaVel = 0
+            this.spherical.basePhiVel = 0
+        }
 
         this.focusPoint.smoothedPosition.copy(this.focusPoint.position)
 
@@ -339,6 +370,16 @@ export class View
         this.spherical = {}
         this.spherical.phi = Math.PI * (this.game.quality.level === 0 ? 0.31 : 0.27)
         this.spherical.theta = Math.PI * 0.25
+
+        // 车辆跟随基础视角的平滑状态（二阶：位置+速度，滤微抖又有转向惯性）
+        this.spherical.baseTheta = this.spherical.theta
+        this.spherical.baseThetaVel = 0
+        this.spherical.basePhi = this.spherical.phi
+        this.spherical.basePhiVel = 0
+
+        // 第一视角相机位置平滑
+        this.spherical.cockpitPosition = new THREE.Vector3()
+        this.spherical.cockpitTarget = new THREE.Vector3()
 
         this.spherical.radius = {}
         this.spherical.radius.edges = { min: 15, max: 30 }
@@ -625,7 +666,7 @@ export class View
     setMouseLook()
     {
         this.mouseLook = {}
-        this.mouseLook.sensitivity = 0.0025
+        this.mouseLook.sensitivity = 0.0018
         this.mouseLook.phiEdges = { min: Math.PI * 0.04, max: Math.PI * 0.47 }
         this.mouseLook.isLocked = false
         this.mouseLook.isLockAvailable = null
@@ -633,6 +674,12 @@ export class View
         this.mouseLook.isIntersecting = false
         this.mouseLook.crosshairElement = document.querySelector('.js-crosshair')
         this.mouseLook.clickPosition = { x: 0, y: 0 }
+
+        // 叠加偏移：车辆 forward 决定基础视角 theta/phi，用户微调只是在上面叠加 offset
+        // offset 松手后衰减归零，视角自动回归默认跟车
+        this.mouseLook.yawOffset = 0
+        this.mouseLook.pitchOffset = 0
+        this.mouseLook.decayRate = 0.85 // delta 时间常数越大回弹越快
 
         const isMouseLookAllowed = () =>
         {
@@ -766,21 +813,22 @@ export class View
             this.mouseLook.isLockAvailable = false
         })
 
-        // Mouse movement => Rotate the view
+        // Mouse movement => Accumulate offset on top of vehicle's base angle
         document.addEventListener('mousemove', (_event) =>
         {
             if((!this.mouseLook.isLocked && !this.mouseLook.dragActive) || this.mode !== View.MODE_DEFAULT)
                 return
 
-            // Yaw
-            this.spherical.theta -= _event.movementX * this.mouseLook.sensitivity
+            // Yaw offset (用户偏航微调)
+            this.mouseLook.yawOffset -= _event.movementX * this.mouseLook.sensitivity
 
-            const loop = Math.PI * 2
-            this.spherical.theta = ((this.spherical.theta + Math.PI) % loop + loop) % loop - Math.PI
-
-            // Pitch
-            this.spherical.phi -= _event.movementY * this.mouseLook.sensitivity
-            this.spherical.phi = clamp(this.spherical.phi, this.mouseLook.phiEdges.min, this.mouseLook.phiEdges.max)
+            // Pitch offset (用户俯仰微调)，clamp 到 phiEdges
+            this.mouseLook.pitchOffset -= _event.movementY * this.mouseLook.sensitivity
+            this.mouseLook.pitchOffset = clamp(
+                this.mouseLook.pitchOffset,
+                this.mouseLook.phiEdges.min - this.spherical.phi,
+                this.mouseLook.phiEdges.max - this.spherical.phi
+            )
         })
 
         // UI takes over => Release the pointer
@@ -824,17 +872,22 @@ export class View
             }
         }
         
-        // Gamepad Joystick map controls
+        // Gamepad Joystick => 叠加 offset（不再断联 isTracking）
         if(this.mode === View.MODE_DEFAULT && this.game.inputs.gamepad.joysticks.right.active && !this.cinematic.active)
         {
-            this.focusPoint.isTracking = false
+            // 左/右 → yaw offset；上/下 → pitch offset
+            const yawDelta = - this.game.inputs.gamepad.joysticks.right.x * 2.5 * this.game.ticker.delta
+            const pitchDelta = - this.game.inputs.gamepad.joysticks.right.y * 2.5 * this.game.ticker.delta
 
-            const mapMovement = new THREE.Vector2(this.game.inputs.gamepad.joysticks.right.x, this.game.inputs.gamepad.joysticks.right.y)
-            mapMovement.rotateAround(new THREE.Vector2(), -this.spherical.theta)
-            mapMovement.multiplyScalar(20 * this.game.ticker.delta)
+            this.mouseLook.yawOffset += yawDelta
+            this.mouseLook.pitchOffset += pitchDelta
 
-            this.focusPoint.position.x += mapMovement.x
-            this.focusPoint.position.z += mapMovement.y
+            // clamp pitch offset
+            this.mouseLook.pitchOffset = clamp(
+                this.mouseLook.pitchOffset,
+                this.mouseLook.phiEdges.min - this.spherical.phi,
+                this.mouseLook.phiEdges.max - this.spherical.phi
+            )
         }
         
         // Focus point
@@ -907,6 +960,72 @@ export class View
             this.zoom.smoothedRatio = lerp(this.zoom.smoothedRatio, this.zoom.ratio, this.game.ticker.delta * 10)
         }
 
+        // offset 衰减：松手后逐渐归零，视角丝滑回归默认
+        if(this.mode === View.MODE_DEFAULT && !this.cinematic.active && this.game.physicalVehicle && this.game.physicalVehicle.forward)
+        {
+            const vf = this.game.physicalVehicle.forward
+            const targetTheta = Math.atan2(- vf.x, - vf.z)
+            const targetPhi = Math.PI * (this.game.quality.level === 0 ? 0.31 : 0.27)
+
+            // 环绕最短路径
+            const loop = Math.PI * 2
+            let dTheta = targetTheta - this.spherical.baseTheta
+            dTheta = ((dTheta + Math.PI) % loop + loop) % loop - Math.PI
+
+            // 二阶平滑（spring-like）：velocity -> acceleration，自然带惯性
+            const stiff = 30    // 越大越硬跟
+            const damp  = 6     // 越小越软慢
+            const dt    = this.game.ticker.delta
+            const thetaAccel = dTheta * stiff - this.spherical.baseThetaVel * damp
+            this.spherical.baseThetaVel += thetaAccel * dt
+            this.spherical.baseTheta += this.spherical.baseThetaVel * dt
+
+            const phiAccel = (targetPhi - this.spherical.basePhi) * stiff - this.spherical.basePhiVel * damp
+            this.spherical.basePhiVel += phiAccel * dt
+            this.spherical.basePhi += this.spherical.basePhiVel * dt
+
+            this.spherical.theta = this.spherical.baseTheta + this.mouseLook.yawOffset
+            this.spherical.phi   = this.spherical.basePhi   + this.mouseLook.pitchOffset
+            this.spherical.phi   = clamp(this.spherical.phi, this.mouseLook.phiEdges.min, this.mouseLook.phiEdges.max)
+
+            const decay = Math.exp(- dt * this.mouseLook.decayRate)
+            this.mouseLook.yawOffset *= decay
+            this.mouseLook.pitchOffset *= decay
+        }
+
+        // 第一视角
+        if(this.mode === View.MODE_COCKPIT && this.game.physicalVehicle && this.game.physicalVehicle.forward)
+        {
+            const vf = this.game.physicalVehicle.forward
+            const vp = this.game.physicalVehicle.position
+            const targetTheta = Math.atan2(vf.x, vf.z)
+
+            const loop = Math.PI * 2
+            let dTheta = targetTheta - this.spherical.baseTheta
+            dTheta = ((dTheta + Math.PI) % loop + loop) % loop - Math.PI
+
+            // 二阶平滑（第一视角跟得更紧，damp 更大）
+            const stiff = 80, damp = 12
+            const dt = this.game.ticker.delta
+            const thetaAccel = dTheta * stiff - this.spherical.baseThetaVel * damp
+            this.spherical.baseThetaVel += thetaAccel * dt
+            this.spherical.baseTheta += this.spherical.baseThetaVel * dt
+
+            this.spherical.theta = this.spherical.baseTheta + this.mouseLook.yawOffset
+            this.spherical.phi   = Math.PI * 0.5 + this.mouseLook.pitchOffset
+            this.spherical.phi   = clamp(this.spherical.phi, Math.PI * 0.2, Math.PI * 0.75)
+
+            // 相机位置 lerp 追目标（车身震动不直接传相机）
+            this.spherical.cockpitTarget.set(vp.x + vf.x * 0.5, vp.y + 1.2, vp.z + vf.z * 0.5)
+            if(this.spherical.cockpitPosition.lengthSq() === 0)
+                this.spherical.cockpitPosition.copy(this.spherical.cockpitTarget)
+            this.spherical.cockpitPosition.lerp(this.spherical.cockpitTarget, 1 - Math.exp(- dt * 20))
+
+            const decay = Math.exp(- dt * this.mouseLook.decayRate)
+            this.mouseLook.yawOffset *= decay
+            this.mouseLook.pitchOffset *= decay
+        }
+
         // Radius
         const radiusMax = this.spherical.radius.edges.max + this.ratioOverflow * this.spherical.radius.nonIdealRatioOffset
         this.spherical.radius.current = lerp(this.spherical.radius.edges.min, radiusMax, 1 - this.zoom.smoothedRatio)
@@ -943,6 +1062,23 @@ export class View
         {
             this.camera.position.copy(this.defaultCamera.position)
             this.camera.quaternion.copy(this.defaultCamera.quaternion)
+        }
+        else if(this.mode === View.MODE_COCKPIT && this.game.physicalVehicle && this.game.physicalVehicle.forward)
+        {
+            // 用已经平滑过的 cockpitPosition（车身震动不直接传相机）
+            this.camera.position.copy(this.spherical.cockpitPosition)
+
+            const up = new THREE.Vector3(0, 1, 0)
+            const forwardDir = new THREE.Vector3(
+                Math.sin(this.spherical.phi) * Math.sin(this.spherical.theta),
+                Math.cos(this.spherical.phi),
+                Math.sin(this.spherical.phi) * Math.cos(this.spherical.theta)
+            ).normalize()
+
+            const lookTarget = this.camera.position.clone().add(forwardDir)
+            this.camera.quaternion.copy(new THREE.Quaternion().setFromRotationMatrix(
+                new THREE.Matrix4().lookAt(this.camera.position, lookTarget, up)
+            ))
         }
         else if(this.mode === View.MODE_FREE)
         {
